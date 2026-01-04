@@ -1,4 +1,5 @@
 import numba
+from numba import cuda
 import numpy as np
 from lib import CudaProblem, Coord
 
@@ -344,4 +345,353 @@ problem = CudaProblem(
     spec=dot_spec,
 )
 problem.show()
+problem.check()
+
+# Puzzle 11 - 1D Convolution
+# Implement a kernel that computes a 1D convolution between a and b and stores it in out.
+# You need to handle the general case. You only need 2 global reads and 1 global write per thread.
+
+def conv_spec(a, b):
+    out = np.zeros(*a.shape)
+    len = b.shape[0]
+    for i in range(a.shape[0]):
+        out[i] = sum([a[i + j] * b[j] for j in range(len) if i + j < a.shape[0]])
+    return out
+
+
+MAX_CONV = 4
+TPB = 8
+TPB_MAX_CONV = TPB + MAX_CONV
+SHARED_A = TPB + MAX_CONV - 1  # a core + right halo
+def conv_test(cuda):
+    def call(out, a, b, a_size, b_size) -> None:
+        i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+        local_i = cuda.threadIdx.x
+
+        #
+
+        shared_a = cuda.shared.array(SHARED_A, numba.float32)
+        shared_b = cuda.shared.array(MAX_CONV, numba.float32)
+
+        if i < a_size: # divide up a between blocks
+            shared_a[local_i] = a[i]
+            if local_i == TPB - 1: # the last thread also writes the halo
+                for offset in range(MAX_CONV):
+                    if i + offset < a_size:
+                        shared_a[local_i + offset] = a[i + offset]
+
+        if local_i < b_size: # store b for each block
+            shared_b[local_i] = b[local_i]
+        
+        cuda.syncthreads()
+    
+        if i < a_size:
+            temp = 0
+            for offset in range(MAX_CONV):
+                if local_i + offset < a_size and offset < b_size:
+                    # shared_a: [0..SHARED_A-1]
+                    # shared_b: [0..b_size-1]
+                    temp += shared_a[local_i + offset] * shared_b[offset]
+            
+            out[i] = temp
+
+    return call
+
+
+# Test 1
+
+SIZE = 6
+CONV = 3
+out = np.zeros(SIZE)
+a = np.arange(SIZE)
+b = np.arange(CONV)
+problem = CudaProblem(
+    "1D Conv (Simple)",
+    conv_test,
+    [a, b],
+    out,
+    [SIZE, CONV],
+    Coord(1, 1),
+    Coord(TPB, 1),
+    spec=conv_spec,
+)
+problem.show()
+problem.check()
+
+# Test 2
+
+out = np.zeros(15)
+a = np.arange(15)
+b = np.arange(4)
+problem = CudaProblem(
+    "1D Conv (Full)",
+    conv_test,
+    [a, b],
+    out,
+    [15, 4],
+    Coord(2, 1),
+    Coord(TPB, 1),
+    spec=conv_spec,
+)
+problem.show()
+problem.check()
+
+# Puzzle 12 - Prefix Sum
+# Implement a kernel that computes a sum over a and stores it in out.
+# If the size of a is greater than the block size, only store the sum of each block.
+
+# NOTE: This is not really a prefix sum. We'll implement that later.
+
+TPB = 8
+def sum_spec(a):
+    out = np.zeros((a.shape[0] + TPB - 1) // TPB)
+    for j, i in enumerate(range(0, a.shape[-1], TPB)):
+        out[j] = a[i : i + TPB].sum()
+    return out
+
+
+def sum_test(cuda):
+    def call(out, a, size: int) -> None:
+        cache = cuda.shared.array(TPB, numba.float32)
+        i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+        local_i = cuda.threadIdx.x
+
+        #
+
+        cache[local_i] = a[i] if i < size else 0.0 # prevent partial block from corrupting the sum
+        cuda.syncthreads()
+        
+        # Tree reduction
+        stride = 1 # 1, 2, 4
+        while stride < TPB:
+            participates = local_i % (stride * 2) == 0
+            if participates:
+                temp = cache[local_i] + cache[local_i + stride]
+            cuda.syncthreads() # let all threads reach to prevent deadlock
+            if participates:
+                cache[local_i] = temp
+            cuda.syncthreads()
+            stride *= 2
+
+        if local_i == 0:
+            out[cuda.blockIdx.x] = cache[0]
+
+    return call
+
+
+# Test 1
+
+SIZE = 8
+out = np.zeros(1)
+inp = np.arange(SIZE)
+problem = CudaProblem(
+    "Sum (Simple)",
+    sum_test,
+    [inp],
+    out,
+    [SIZE],
+    Coord(1, 1),
+    Coord(TPB, 1),
+    spec=sum_spec,
+)
+problem.show()
+problem.check()
+
+# Test 2
+
+SIZE = 15
+out = np.zeros(2)
+inp = np.arange(SIZE)
+problem = CudaProblem(
+    "Sum (Full)",
+    sum_test,
+    [inp],
+    out,
+    [SIZE],
+    Coord(2, 1),
+    Coord(TPB, 1),
+    spec=sum_spec,
+)
+problem.show()
+problem.check()
+
+# Puzzle 13 - Axis Sum
+# Implement a kernel that computes a sum over each column of a and stores it in out.
+
+TPB = 8
+def sum_spec(a):
+    out = np.zeros((a.shape[0], (a.shape[1] + TPB - 1) // TPB))
+    for j, i in enumerate(range(0, a.shape[-1], TPB)):
+        out[..., j] = a[..., i : i + TPB].sum(-1)
+    return out
+
+
+# not working, why does it think it's kernel rather than device function?
+@cuda.jit(device=True, inline=True)
+def block_reduce_sum(cache, tid):
+    stride = 1
+    while stride < TPB:
+        participates = (tid % (2 * stride) == 0)
+        if participates:
+            tmp = cache[tid] + cache[tid + stride]
+        cuda.syncthreads()
+        if participates:
+            cache[tid] = tmp
+        cuda.syncthreads()
+        stride *= 2
+
+
+def axis_sum_test(cuda): # each block sums across its column
+    def call(out, a, size: int) -> None:
+        cache = cuda.shared.array(TPB, numba.float32)
+        i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+        local_i = cuda.threadIdx.x
+        batch = cuda.blockIdx.y
+
+        # 
+
+        # cache over column
+        cache[local_i] = a[batch, i] if i < size else 0.0
+        cuda.syncthreads()
+
+        # block_reduce_sum(cache, local_i)
+        # tree reduce
+        stride = 1 # 1, 2, 4
+        while stride < TPB:
+            participates = local_i % (stride * 2) == 0
+            if participates:
+                temp = cache[local_i] + cache[local_i + stride]
+            cuda.syncthreads() # let all threads reach to prevent deadlock
+            if participates:
+                cache[local_i] = temp
+            cuda.syncthreads()
+            stride *= 2
+
+        if local_i == 0:
+            out[batch, 0] = cache[0]
+
+    return call
+
+
+BATCH = 4
+SIZE = 6
+out = np.zeros((BATCH, 1))
+inp = np.arange(BATCH * SIZE).reshape((BATCH, SIZE))
+problem = CudaProblem(
+    "Axis Sum",
+    axis_sum_test,
+    [inp],
+    out,
+    [SIZE],
+    Coord(1, BATCH),
+    Coord(TPB, 1),
+    spec=sum_spec,
+)
+problem.show()
+
+# Puzzle 14 - Matrix Multiply!
+# Implement a kernel that multiplies square matrices a and b and stores the result in out.
+
+def matmul_spec(a, b):
+    return a @ b
+
+
+TPB = 3
+# def mm_oneblock_test(cuda):
+#     def call(out, a, b, size: int) -> None:
+#         a_shared = cuda.shared.array((TPB, TPB), numba.float32)
+#         b_shared = cuda.shared.array((TPB, TPB), numba.float32)
+
+#         i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+#         j = cuda.blockIdx.y * cuda.blockDim.y + cuda.threadIdx.y
+#         local_i = cuda.threadIdx.x
+#         local_j = cuda.threadIdx.y
+
+#         # 
+
+#         a_shared[local_j, local_i] = a[j, i] if i < size and j < size else 0.0
+#         b_shared[local_j, local_i] = b[j, i] if i < size and j < size else 0.0
+#         cuda.syncthreads()
+
+#         if i < size and j < size:
+#             temp = 0
+#             for idx in range(size):
+#                 temp += a_shared[local_j, idx] * b_shared[idx, local_i]
+#             out[j, i] = temp
+
+#     return call
+
+def mm_oneblock_test(cuda):
+    def call(out, a, b, size: int) -> None:
+        a_shared = cuda.shared.array((TPB, TPB), numba.float32)
+        b_shared = cuda.shared.array((TPB, TPB), numba.float32)
+
+        i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+        j = cuda.blockIdx.y * cuda.blockDim.y + cuda.threadIdx.y
+        local_i = cuda.threadIdx.x
+        local_j = cuda.threadIdx.y
+
+        # 
+
+        # Read the tile.
+        # - A tile slides right.
+        # - B tile slides down.
+        # This way, we always have what we need to compute partial dot products.
+
+        tile_offset = 0
+        temp = 0
+        while tile_offset < size:
+            # Read tile
+            a_shared[local_j, local_i] = a[j, local_i + tile_offset] if local_i + tile_offset < size and j < size else 0.0
+            b_shared[local_j, local_i] = b[local_j + tile_offset, i] if i < size and local_j + tile_offset < size else 0.0
+            cuda.syncthreads()
+            # Accumulate dot product
+            if i < size and j < size:
+                for idx in range(TPB):
+                    temp += a_shared[local_j, idx] * b_shared[idx, local_i]
+            tile_offset += TPB
+            cuda.syncthreads()
+        if i < size and j < size:
+            out[j, i] = temp # single global write
+
+    return call
+
+# Test 1
+
+SIZE = 2
+out = np.zeros((SIZE, SIZE))
+inp1 = np.arange(SIZE * SIZE).reshape((SIZE, SIZE))
+inp2 = np.arange(SIZE * SIZE).reshape((SIZE, SIZE)).T
+
+problem = CudaProblem(
+    "Matmul (Simple)",
+    mm_oneblock_test,
+    [inp1, inp2],
+    out,
+    [SIZE],
+    Coord(1, 1),
+    Coord(TPB, TPB),
+    spec=matmul_spec,
+)
+problem.show(sparse=True)
+problem.check()
+
+# Test 2
+
+SIZE = 8
+out = np.zeros((SIZE, SIZE))
+inp1 = np.arange(SIZE * SIZE).reshape((SIZE, SIZE))
+inp2 = np.arange(SIZE * SIZE).reshape((SIZE, SIZE)).T
+
+problem = CudaProblem(
+    "Matmul (Full)",
+    mm_oneblock_test,
+    [inp1, inp2],
+    out,
+    [SIZE],
+    Coord(3, 3),
+    Coord(TPB, TPB),
+    spec=matmul_spec,
+)
+problem.show(sparse=True)
 problem.check()
