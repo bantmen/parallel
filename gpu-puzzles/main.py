@@ -597,31 +597,7 @@ def matmul_spec(a, b):
 
 
 TPB = 3
-# def mm_oneblock_test(cuda):
-#     def call(out, a, b, size: int) -> None:
-#         a_shared = cuda.shared.array((TPB, TPB), numba.float32)
-#         b_shared = cuda.shared.array((TPB, TPB), numba.float32)
-
-#         i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
-#         j = cuda.blockIdx.y * cuda.blockDim.y + cuda.threadIdx.y
-#         local_i = cuda.threadIdx.x
-#         local_j = cuda.threadIdx.y
-
-#         # 
-
-#         a_shared[local_j, local_i] = a[j, i] if i < size and j < size else 0.0
-#         b_shared[local_j, local_i] = b[j, i] if i < size and j < size else 0.0
-#         cuda.syncthreads()
-
-#         if i < size and j < size:
-#             temp = 0
-#             for idx in range(size):
-#                 temp += a_shared[local_j, idx] * b_shared[idx, local_i]
-#             out[j, i] = temp
-
-#     return call
-
-def mm_oneblock_test(cuda):
+def mm_oneblock_test(cuda): # not actually one block
     def call(out, a, b, size: int) -> None:
         a_shared = cuda.shared.array((TPB, TPB), numba.float32)
         b_shared = cuda.shared.array((TPB, TPB), numba.float32)
@@ -694,4 +670,76 @@ problem = CudaProblem(
     spec=matmul_spec,
 )
 problem.show(sparse=True)
+problem.check()
+
+### Custom puzzles ###
+
+# Actual prefix sum
+
+TPB = 8
+ITEMS_PER_THREAD = 4
+SIZE = TPB * ITEMS_PER_THREAD  # 32 (> TPB)
+
+def prefix_spec(a):
+    return np.cumsum(a).astype(np.float32)
+
+def prefix_test(cuda):
+    def call(out, a, size: int) -> None:
+        # NOTE: Can't use local array because of weirdness with the harness, we dont need this to be shared memory
+        # thread_vals = numba.cuda.local.array(SIZE, numba.float32) # holds per-element partials
+        thread_vals = cuda.shared.array(SIZE, numba.float32)   # holds per-element partials
+        shared_sums = cuda.shared.array(TPB, numba.float32)    # holds per-thread totals
+
+        local_i = cuda.threadIdx.x
+        # Each thread handles a contiguous "stripe" of ITEMS_PER_THREAD elements
+        base = local_i * ITEMS_PER_THREAD
+
+        # each thread cumsums its own items
+        temp = 0
+        for offset in range(ITEMS_PER_THREAD):
+            global_idx = base + offset
+            if global_idx < size:
+                temp += a[global_idx]
+                thread_vals[global_idx] = temp
+        shared_sums[local_i] = temp
+        cuda.syncthreads()
+
+        # hillis-steele cumsum on shared_sums
+        lookback = 1
+        while lookback < TPB:
+            participates =  local_i - lookback >= 0
+            if local_i - lookback >= 0:
+                temp = shared_sums[local_i] + shared_sums[local_i - lookback]
+            cuda.syncthreads()
+            if participates:
+                shared_sums[local_i] = temp
+            cuda.syncthreads()
+            lookback *= 2
+            
+        # each thread gets the final cumsums
+        prev_sum = shared_sums[local_i - 1] if local_i - 1 >= 0 else 0
+        for offset in range(ITEMS_PER_THREAD):
+            global_idx = base + offset
+            if global_idx < size:
+                out[global_idx] = thread_vals[global_idx] + prev_sum
+
+    return call
+
+
+# Single test (size > TPB)
+inp = np.arange(SIZE, dtype=np.float32)
+out = np.zeros(SIZE, dtype=np.float32)
+
+problem = CudaProblem(
+    name="Prefix Sum (Inclusive, size>TPB, 1 block)",
+    fn=prefix_test,
+    inputs=[inp],
+    out=out,
+    args=[SIZE],
+    blockspergrid=Coord(1, 1),
+    threadsperblock=Coord(TPB, 1),
+    spec=prefix_spec,
+)
+
+problem.show()
 problem.check()
